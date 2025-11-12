@@ -52,6 +52,7 @@ class PathPlanner(Node):
         self.rate = 5
         self.dt = 1.0 / self.rate
         self.timer = self.create_timer(self.dt, self.mainloop)
+        self.get_logger().info('Waiting for goal from tower to map')
 
     # Map callback
     def get_map(self, msg):
@@ -88,6 +89,7 @@ class PathPlanner(Node):
 
             # Get the drone position
             self.goal_position = [x, y]
+            self.get_logger().info(f'Received goal in world coords: {(x, y)}')
 
             # Reset plan
             self.have_plan = False
@@ -110,11 +112,6 @@ class PathPlanner(Node):
                 else:
                     self.get_logger().info('Path not found, try another goal')
         else: # We have a plan, execute it
-            # Publish the path
-            if len(self.p_path.data) != len(np.reshape(self.path,-1)):
-                self.p_path.data = np.reshape(self.path,-1)
-                self.path_pub.publish(self.p_path)
-
             # Publish the current waypoint
             if self.at_waypoint == False or self.sent_position == False or np.shape(self.path)[0] < 0:
                 msg = Vector3()
@@ -132,6 +129,10 @@ class PathPlanner(Node):
                 self.have_plan = False
                 self.drone_position = copy.deepcopy(self.goal_position)
                 self.goal_position = []
+                # Publish the path
+            if len(self.p_path.data) != len(np.reshape(self.path,-1)):
+                self.p_path.data = np.reshape(self.path,-1)
+                self.path_pub.publish(self.p_path)
 
 
 

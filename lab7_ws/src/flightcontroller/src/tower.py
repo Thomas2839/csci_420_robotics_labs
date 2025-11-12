@@ -14,7 +14,6 @@ from nav_msgs.msg import OccupancyGrid
 from transforms3d._gohlketransforms import euler_from_quaternion, quaternion_from_euler
 from geometry_msgs.msg import PointStamped
 from tf2_geometry_msgs import do_transform_point
-from tf2_ros import TransformException
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 import traceback
@@ -22,7 +21,7 @@ class Tower(Node):
 
     def __init__(self):
 
-        time.sleep(10)
+        time.sleep(15)
         super().__init__('TowerNode')
 
         # Goal publisher
@@ -41,23 +40,25 @@ class Tower(Node):
             depth=10
         )
         self.map_sub = self.create_subscription(OccupancyGrid, "/map", self.get_map, qos)
-        self.traj_sub = self.create_subscription(Int32MultiArray, '/uav/trajectory', self.handle_traj, 1)
+        self.traj_sub = self.create_subscription(Int32MultiArray, '/uav/path', self.handle_traj, 1)
 
         # Transform
         # This is the transfrom from tester node
         self.towertransform = TransformStamped()
-        self.towertransform.transform.translation.x = float(-128)
-        self.towertransform.transform.translation.y = float(77)
+        self.towertransform.transform.translation.x = -128.5751
+        self.towertransform.transform.translation.y = 77.25571
         self.towertransform.transform.translation.z = float(0)
 
         quat = quaternion_from_euler(float(0), float(0), float(+0.523599))
-        self.towertransform.transform.rotation.x = quat[0]
-        self.towertransform.transform.rotation.y = quat[1]
-        self.towertransform.transform.rotation.z = quat[2]
-        self.towertransform.transform.rotation.w = quat[3]
+        self.towertransform.transform.rotation.x = quat[1]
+        self.towertransform.transform.rotation.y = quat[2]
+        self.towertransform.transform.rotation.z = quat[3]
+        self.towertransform.transform.rotation.w = quat[0]
 
         self.towertransform.header.frame_id = 'tower'
         self.towertransform.child_frame_id = 'world'
+
+        self.cur_goal = None
 
         # start main loop
         self.rate = 10
@@ -65,7 +66,7 @@ class Tower(Node):
         self.timer = self.create_timer(self.dt, self.mainloop)
 
     def handle_traj(self, msg):
-        if len(msg.data) <= 2:
+        if len(msg.data) == 0:
             self.empty_traj = True
         else:
             self.empty_traj = False
@@ -109,8 +110,10 @@ class Tower(Node):
                 self.get_logger().info(f'Published goal [{new_point.point.x}, {new_point.point.y}]')
                 msg = Vector3()
                 msg.x, msg.y, msg.z = float(new_point.point.x), float(new_point.point.y), 0.0
-                self.goal_pub.publish(msg)
+                self.cur_goal = msg
                 self.has_new_goal = True
+        if self.empty_traj and self.cur_goal:
+            self.goal_pub.publish(self.cur_goal)
 
     # Expand the obstacles by distance so you do not hit one
     def expand_obstacles(self, map_data, distance):
