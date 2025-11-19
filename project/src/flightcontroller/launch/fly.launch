@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="map_width" default="11" />
+  <arg name="map_height" default="11" />
+  <arg name="seed" default="6" />
+
+  <include file="$(find-pkg-share visualizer)/launch/view.launch">
+  </include>
+
+  <include file="$(find-pkg-share flightcontroller)/launch/position.launch">
+  </include>
+
+    <node pkg="simple_sim" exec="simple_sim_node" name="simple_sim_node" output="screen" on_exit="shutdown"></node>
+
+  <include file="$(find-pkg-share simple_control)/launch/simple_control.launch">
+    <arg name="map_width" value="$(var map_width)" />
+    <arg name="map_height" value="$(var map_height)" />
+  </include>
+
+  <node name="environment_controller" pkg="environment_controller" exec="environment_controller_node" output="screen">
+    <param name="map_width" type="int" value="$(var map_width)" />
+    <param name="map_height" type="int" value="$(var map_height)" />
+    <param name="seed" type="int" value="$(var seed)" />
+  </node>
+</launch>

@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+
+<launch>
+
+  <node pkg="imu_filter_madgwick" exec="imu_filter_madgwick_node" name="filter_node">
+    <remap from="imu/data" to="/uav/sensors/filtered_imu"/>
+    <remap from="/tf" to="/tf_odom"/>
+    <param name="use_mag" value="false"/>
+    <param name="use_magnetic_field_msg" value="false"/>
+    <param name="publish_tf" value="false"/>
+    <param name="world_frame" value="nwu"/>
+  </node>
+
+  <node pkg="flightcontroller" exec="angle_calculator.py" name="angle_calculator_node" output="screen">
+  </node>
+
+  <node pkg="flightcontroller" exec="angle_controller.py" name="angle_controller_node" output="screen">
+    <param name="/angle_controller_node/gains/p" type="float" value="3.0" />
+    <param name="/angle_controller_node/gains/i" type="float" value="0.0" />
+    <param name="/angle_controller_node/gains/d" type="float" value="0.2" />
+  </node>
+
+</launch>
