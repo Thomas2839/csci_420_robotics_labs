@@ -1,6 +1,0 @@
-<?xml version="1.0"?>
-<launch>
-  <node pkg="rocketship" exec="rocket_engine.py" name="RocketEngineNode"></node>
-  <node pkg="rocketship" exec="main_controller" name="MainControllerNode" output="screen"></node>
-  <node pkg="rocketship" exec="countdown" name="CountDownNode"></node>
-</launch>
