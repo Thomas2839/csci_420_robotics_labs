@@ -19,9 +19,9 @@ import rclpy
 from rclpy.node import Node
 
 from nav_msgs.msg import OccupancyGrid, MapMetaData
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point
 from sensor_msgs.msg import LaserScan
-
+from environment_controller.srv import UseKey
 
 class RescueMission(Node):
 	"""Simple ROS2 node producing an OccupancyGrid from LIDAR and GPS.
@@ -71,6 +71,12 @@ class RescueMission(Node):
 
 		# Publish map periodically so GUI picks it up
 		self.create_timer(0.5, self.publish_map)
+
+		# Service client for opening doors (used for checkpoint demo)
+		self.use_key_client = self.create_client(UseKey, 'use_key')
+		self._tried_open_right = False
+		# Small timer to attempt opening the door to the right of start
+		self.create_timer(9, self._attempt_open_right)
 
 		# Mark start cell as free (drone starts at 0,0)
 		sx, sy = self.world_to_map(0.0, 0.0)
@@ -262,6 +268,47 @@ class RescueMission(Node):
 		msg.data = [int(g) for g in self.grid]
 
 		self.map_pub.publish(msg)
+
+	def _attempt_open_right(self):
+		"""Try to open the door immediately to the right of start (1,0).
+
+		This method runs from a short timer at startup. It only tries once
+		and requests the `use_key` service with the world point (1.0, 0.0).
+		"""
+		if self._tried_open_right:
+			return
+		self._tried_open_right = True
+
+		# Ensure service exists (short timeout) — we don't block startup long
+		if not self.use_key_client.wait_for_service(timeout_sec=1.0):
+			self.get_logger().warning('use_key service not available (open-right)')
+			return
+
+		req = UseKey.Request()
+		req.door_loc = Point()
+		req.door_loc.x = 1.0
+		req.door_loc.y = 0.0
+		req.door_loc.z = 0.0
+
+		future = self.use_key_client.call_async(req)
+		future.add_done_callback(self._open_right_response)
+
+	def _open_right_response(self, fut):
+		try:
+			res = fut.result()
+		except Exception as e:
+			self.get_logger().warning(f'use_key call for right door failed: {e}')
+			return
+
+		if getattr(res, 'success', False):
+			# mark the right-hand cell as opened door sentinel (-2)
+			mx, my = self.world_to_map(1.0, 0.0)
+			idx = self.map_index(mx, my)
+			if idx >= 0:
+				self.grid[idx] = -2
+			self.get_logger().info('Right-side door opened successfully')
+		else:
+			self.get_logger().info('Right-side door use_key returned false')
 
 
 def main(args=None):
