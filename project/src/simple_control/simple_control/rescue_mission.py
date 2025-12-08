@@ -8,7 +8,6 @@ required for the final checkpoint:
 - follow that path using /uav/input/position
 - detect doors blocking the path and attempt to open them using the use_key service
 - publish the final shortest path on /uav/final_path
-
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ import time
 import heapq
 import rclpy
 from rclpy.node import Node
-from rclpy.time import Time
 
 from nav_msgs.msg import OccupancyGrid, MapMetaData
 from geometry_msgs.msg import PoseStamped, Point, Vector3, PointStamped
@@ -27,11 +25,14 @@ from std_msgs.msg import Int32, Int32MultiArray
 
 from environment_controller.srv import UseKey
 
+import numpy as np
 from .door_detector import DoorDetector
 
 import tf2_ros
 from tf2_ros import TransformException
-from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_point
+from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_point  # (import kept if you need it later)
+
+from simple_control.astar_class import AStarPlanner
 
 
 class RescueMission(Node):
@@ -481,11 +482,11 @@ class RescueMission(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = RescueMission()
-    rclpy.spin(node)
-    rclpy.shutdown()
+	rclpy.init(args=args)
+	node = RescueMission()
+	rclpy.spin(node)
+	rclpy.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+	main()
