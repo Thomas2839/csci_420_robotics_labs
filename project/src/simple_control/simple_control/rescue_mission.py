@@ -20,7 +20,7 @@ from rclpy.node import Node
 from rclpy.time import Time
 
 from nav_msgs.msg import OccupancyGrid, MapMetaData
-from geometry_msgs.msg import PoseStamped, Vector3, PointStamped
+from geometry_msgs.msg import PoseStamped, Vector3, PointStamped, Point
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int32, Int32MultiArray
 
@@ -46,7 +46,7 @@ class RescueMission(Node):
 
     # ============================
     # Mission states (your design)
-    # ============================
+    # ============================ 
     EXPLORING_WORLD = 0
     LOCATING_DOORS = 1
     OPENING_DOORS = 2
@@ -59,22 +59,21 @@ class RescueMission(Node):
         # ============================
         # MAPPING SETUP
         # ============================
-
-        default_w = 23   
+        default_w = 23
         default_h = 23
         self.declare_parameter('map_width', default_w)
         self.declare_parameter('map_height', default_h)
 
-        self.map_width = int(self.get_parameter('map_width').value)
-        self.map_height = int(self.get_parameter('map_height').value)
+        self.map_width = int(self.get_parameter('map_width').get_parameter_value().integer_value)
+        self.map_height = int(self.get_parameter('map_height').get_parameter_value().integer_value)
 
-        self.resolution = None
+        # We use 1 meter per cell (resolution 1.0)
+        self.resolution = 1.0
 
-        # map origin in world frame (so cell centers line up with integers)
         self.origin_x = -self.map_width / 2.0 + 0.5
         self.origin_y = -self.map_height / 2.0 + 0.5
 
-        # Occupancy grid: row-major
+        # Occupancy grid stored as flat list in row-major (x,y) to match GUI
         self.grid = [50] * (self.map_width * self.map_height)
 
         self.map_ready = False
@@ -96,7 +95,10 @@ class RescueMission(Node):
             Int32, "/keys_remaining", self.keys_cb, 10
         )
         self.map_sub = self.create_subscription(
-            OccupancyGrid,"/map",self.map_callback, 10
+            OccupancyGrid, "/map", self.map_callback, 10
+        )
+        self.dog_sub = self.create_subscription(
+            Point, '/cell_tower/position', self.dog_callback, 10
         )
 
         # TF
@@ -105,6 +107,9 @@ class RescueMission(Node):
 
         # Services
         self.use_key_client = self.create_client(UseKey, 'use_key')
+
+        # Dog
+        self.dog_msg = None
 
         # Internal state
         self.has_gps = False
@@ -151,10 +156,11 @@ class RescueMission(Node):
     # Coordinate conversions
     # ============================
 
-    def world_to_map(self, wx, wy):
-        mx = int(math.floor((wx - self.origin_x) / self.resolution))
-        my = int(math.floor((wy - self.origin_y) / self.resolution))
+    def world_to_map(self, wx: float, wy: float) -> tuple[int, int]:
+        mx = int(math.floor((wx - self.origin_x) + 0.5))
+        my = int(math.floor((wy - self.origin_y) + 0.5))
         return mx, my
+
 
     def map_to_world(self, mx, my):
         wx = self.origin_x + (mx + 0.5) * self.resolution
@@ -215,42 +221,16 @@ class RescueMission(Node):
             f"Map loaded: {self.map_width}x{self.map_height}, origin=({self.origin_x},{self.origin_y}), res={self.resolution}"
         )
 
-    def update_goal_from_tf(self):
-        if self.has_goal:
-            return
+    def dog_callback(self, msg):
+        wrapped = PointStamped()
+        wrapped.header.frame_id = "cell_tower"
+        wrapped.header.stamp = self.get_clock().now().to_msg()
+        wrapped.point = msg
+        self.dog_msg = wrapped
 
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                "cell_tower", "world", rclpy.time.Time()
-            )
-
-            gx = transform.transform.translation.x
-            gy = transform.transform.translation.y
-
-            self.get_logger().info(
-                f"[TF-GOAL] Dog located via TF at tower=({gx:.2f}, {gy:.2f})"
-            )
-
-            mx, my = self.world_to_map(gx, gy)
-            # Hardcode for debugging:
-            self.goal = (10, 10)  # map coordinates
-
-            self.get_logger().info(f"Debug goal set to {self.goal}")
-            self.goal_cell = (10, 10)
-            self.has_goal = True
-
-            idx = self.map_index(mx, my)
-            if idx >= 0:
-                self.grid[idx] = -3
-
-            self.get_logger().info(
-                f"[TF-GOAL] Mapped dog to cell=({mx},{my}) — goal set."
-            )
-
-        except Exception as e:
-            # Normal until TF has enough data
-            self.get_logger().debug(f"[TF-GOAL] TF not ready: {e}")
-
+        self.get_logger().info(
+            f"[DOG] Point wrapped → PointStamped: ({msg.x:.2f}, {msg.y:.2f}, {msg.z:.2f})"
+        )
 
     def lidar_callback(self, msg: LaserScan):
         # Mapping happens regardless of mission state
@@ -339,6 +319,50 @@ class RescueMission(Node):
                                 )
         except Exception as e:
             self.get_logger().warn(f"Door detection error: {e}")
+
+    # ============================
+    # Updating Goal 
+    # ============================
+
+    def update_goal_from_tf(self):
+        if self.has_goal:
+            return
+
+        try:
+            """ # 1. Construct origin  in cell_tower frame
+            p = PointStamped()
+            p.header.frame_id = "cell_tower"
+            p.header.stamp = rclpy.time.Time().to_msg()
+            p.point.x = 0
+            p.point.y = 0
+            p.point.z = 0 """
+
+            # 2. Transform it into world frame
+            transform = self.tf_buffer.lookup_transform("cell_tower", "world", rclpy.time.Time())
+            dwp = do_transform_point(self.dog_msg, transform)
+            # origin_world_point = do_transform_point(p, transform)
+
+            self.get_logger().info(
+                f"[TF] dog_world    = ({dwp.point.x:.2f}, "
+                f"{dwp.point.y:.2f}, {dwp.point.z:.2f})"
+            )
+
+            # 2. Take transformed dog x and y
+            gdx = dwp.point.x 
+            gdy = dwp.point.y
+
+            self.get_logger().info(
+                f"[TF-GOAL] Dog world position = ({gdx:.2f}, {gdy:.2f})"
+            )
+
+            # 3. Convert world → map
+            mx, my = self.world_to_map(gdx, gdy)
+            self.goal_cell = (mx, my)
+            self.has_goal = True
+
+        except Exception as e:
+            self.get_logger().debug(f"[TF-GOAL] failed: {e}")
+
 
     # ============================
     # Mission State Machine
@@ -465,6 +489,35 @@ class RescueMission(Node):
     # ============================
     # MOVING_TO_WAYPOINT
     # ============================
+    def path_clear_between(self, sx, sy, tx, ty, step=0.2):
+        """
+        Check if the line from (sx, sy) to (tx, ty) crosses any blocked cell.
+        step: distance increments in meters.
+        Returns True if path is clear.
+        """
+        dist = math.hypot(tx - sx, ty - sy)
+        
+        # If the point is basically the same, treat as clear
+        if dist < 1e-3:
+            return True
+
+        steps = max(1, int(dist / step))
+
+        for i in range(steps + 1):
+            t = i / steps
+            x = sx + (tx - sx) * t
+            y = sy + (ty - sy) * t
+            mx, my = self.world_to_map(x, y)
+            cell = self.get_cell(mx, my)
+
+            # Blocked if:
+            #   - outside map (cell is None)
+            #   - high occupancy (>= 70)
+            #   - closed door (-1)
+            if cell is None or cell >= 70 or cell == -1:
+                return False
+
+        return True
 
     def follow_path_step(self):
         # High-level movement debug
@@ -493,38 +546,74 @@ class RescueMission(Node):
             f"[MOVE] Target WP#{self.wp_index}: world=({wx:.2f},{wy:.2f}) map={mx,my} cell_val={cell}"
         )
 
-        # Check for obstacle at waypoint
-        if cell is not None and cell >= 70:
+        # Check obstacle at the waypoint
+        if cell is not None and (cell >= 70 or cell == -1):
             self.get_logger().warn(
-                f"[BLOCK] Path blocked at map cell {mx,my} (val={cell}) → switching to LOCATING_DOORS"
+                f"[BLOCK] Path blocked at map cell {mx,my} (val={cell}) → LOCATING_DOORS"
             )
             self.current_blocked_cell = (mx, my)
             self.state = self.LOCATING_DOORS
             return
 
-        # NORMAL MOVEMENT
+        # Check the line between drone → waypoint
+        if not self.path_clear_between(self.drone_x, self.drone_y, wx, wy):
+            self.get_logger().warn(
+                f"[BLOCK] Obstacle detected along path to WP#{self.wp_index} → LOCATING_DOORS"
+            )
+            self.current_blocked_cell = (mx, my)
+            self.state = self.LOCATING_DOORS
+            return
+
+        # ----------------------------------------------------------
+        #  MOVEMENT LOGIC: MOVE IN STRAIGHT LINES (NO DIAGONALS)
+        # ----------------------------------------------------------
+
+        dx = wx - self.drone_x
+        dy = wy - self.drone_y
+
+        # Determine movement direction
+        if abs(dx) > abs(dy):
+            # Move horizontally
+            step = 0.5 if dx > 0 else -0.5
+            target_x = self.drone_x + step
+            target_y = self.drone_y
+        else:
+            # Move vertically
+            step = 0.5 if dy > 0 else -0.5
+            target_x = self.drone_x
+            target_y = self.drone_y + step
+
         self.get_logger().info(
-            f"[MOVE] Publishing movement command → ({wx:.2f}, {wy:.2f})"
+            f"[MOVE] Moving straight-line step → ({target_x:.2f}, {target_y:.2f})"
         )
-        cmd = Vector3(x=float(wx), y=float(wy), z=0.0)
+
+        cmd = Vector3(x=float(target_x), y=float(target_y), z=0.0)
         self.cmd_pub.publish(cmd)
 
+        # ----------------------------------------------------------
         # ARRIVAL CHECK
+        # ----------------------------------------------------------
+
         dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
         self.get_logger().info(f"[MOVE] Distance to WP = {dist:.3f}")
 
         if dist < 0.4:
             self.get_logger().info(f"[ARRIVAL] Arrived at WP#{self.wp_index}")
+            
+            # Add current cell to visited set
+            self.visited_cells.add((mx, my))
 
-            # Door sealing logic
+            # If this was an open door AND we have now passed through it,
+            # then convert it to a wall (100) only AFTER leaving it.
             if cell == -2:
                 idx = self.map_index(mx, my)
                 if idx >= 0:
                     self.grid[idx] = 100
                     self.get_logger().info(
-                        f"[DOOR] Sealing door behind drone at cell {mx,my} (now marked wall)"
+                        f"[DOOR] Sealed door at {mx,my} AFTER visiting (correct behavior)"
                     )
 
+            # Advance to next waypoint
             self.wp_index += 1
             self.get_logger().info(f"[MOVE] Advancing to WP#{self.wp_index}")
 
