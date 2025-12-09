@@ -17,9 +17,10 @@ import time
 import heapq
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 
 from nav_msgs.msg import OccupancyGrid, MapMetaData
-from geometry_msgs.msg import PoseStamped, Point, Vector3, PointStamped
+from geometry_msgs.msg import PoseStamped, Vector3, PointStamped
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int32, Int32MultiArray
 
@@ -30,36 +31,36 @@ from .door_detector import DoorDetector
 
 import tf2_ros
 from tf2_ros import TransformException
-from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_point  # (import kept if you need it later)
+from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_point
 
-from simple_control.astar_class import AStarPlanner
+from rclpy.serialization import deserialize_message
+from rosidl_runtime_py.utilities import get_message
+
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+
+from simple_control.astar_class import AStarPlanner 
 
 
 class RescueMission(Node):
-    """Combined mapping + planning node.
-    New additions include:
-    - TF conversion of dog position
-    - A* path planning
-    - Simple mission state machine
-    - Basic local check for doors
-    - Movement commands via /uav/input/position
-    """
+    """Combined mapping + planning node with explicit mission states."""
 
-    # simple mission states
-    WAIT_FOR_GOAL = 0
-    PLAN_PATH = 1
-    FOLLOW_PATH = 2
-    AT_GOAL = 3
+    # ============================
+    # Mission states (your design)
+    # ============================
+    EXPLORING_WORLD = 0
+    LOCATING_DOORS = 1
+    OPENING_DOORS = 2
+    MOVING_TO_WAYPOINT = 3
+    UPDATING_MAP = 4
+    AT_GOAL = 5
 
     def __init__(self):
-        super().__init__('rescue_mission_node')
-
+        super().__init__('rescue_mission')
         # ============================
         # MAPPING SETUP
         # ============================
 
-        # Map parameters
-        default_w = 23
+        default_w = 23   
         default_h = 23
         self.declare_parameter('map_width', default_w)
         self.declare_parameter('map_height', default_h)
@@ -67,37 +68,45 @@ class RescueMission(Node):
         self.map_width = int(self.get_parameter('map_width').value)
         self.map_height = int(self.get_parameter('map_height').value)
 
-        # We use 1 meter per cell (resolution 1.0)
-        self.resolution = 1.0
+        self.resolution = None
 
-        # Map origin: bottom-left in world coordinates; drone starts at (0,0)
-        # Shift the origin by +0.5 so cell centers align with integer
+        # map origin in world frame (so cell centers line up with integers)
         self.origin_x = -self.map_width / 2.0 + 0.5
         self.origin_y = -self.map_height / 2.0 + 0.5
 
-        # Occupancy grid stored as flat list in row-major (x,y) to match GUI
+        # Occupancy grid: row-major
         self.grid = [50] * (self.map_width * self.map_height)
 
-        # publishers
+        self.map_ready = False
+
+        # Publishers
         self.map_pub = self.create_publisher(OccupancyGrid, '/map', 1)
         self.cmd_pub = self.create_publisher(Vector3, "/uav/input/position", 10)
         self.final_path_pub = self.create_publisher(Int32MultiArray, "/uav/final_path", 1)
         self.debug_path_pub = self.create_publisher(Int32MultiArray, "/uav/path", 1)
 
-        # subscribers
-        self.gps_sub = self.create_subscription(PoseStamped, '/uav/sensors/gps', self.gps_callback, 10)
-        self.lidar_sub = self.create_subscription(LaserScan, '/uav/sensors/lidar', self.lidar_callback, 10)
-        self.key_sub = self.create_subscription(Int32, "/keys_remaining", self.keys_cb, 10)
-        self.cell_sub = self.create_subscription(PointStamped, "/cell_tower/position", self.cell_tower_cb, 10)
+        # Subscribers
+        self.gps_sub = self.create_subscription(
+            PoseStamped, '/uav/sensors/gps', self.gps_callback, 10
+        )
+        self.lidar_sub = self.create_subscription(
+            LaserScan, '/uav/sensors/lidar', self.lidar_callback, 10
+        )
+        self.key_sub = self.create_subscription(
+            Int32, "/keys_remaining", self.keys_cb, 10
+        )
+        self.map_sub = self.create_subscription(
+            OccupancyGrid,"/map",self.map_callback, 10
+        )
 
-        # TF buffer/listener
+        # TF
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # door-opening service
+        # Services
         self.use_key_client = self.create_client(UseKey, 'use_key')
 
-        # internal state
+        # Internal state
         self.has_gps = False
         self.drone_x = 0.0
         self.drone_y = 0.0
@@ -110,39 +119,46 @@ class RescueMission(Node):
         self.current_path_cells = []
         self.current_path_world = []
         self.wp_index = 0
-        self.tried_door_cells = set()
 
-        # mission state
-        self.state = self.WAIT_FOR_GOAL
+        # doors
+        self.door_detector = DoorDetector(
+            buffer_size=6, sample_interval=0.8, std_multiplier=2.0
+        )
+        self.detected_doors = set()       # set of (mx, my) cells
+        self.tried_door_cells = set()     # doors we've already tried
+        self.current_blocked_cell = None  # where we discovered an obstruction
+        self.current_door_cell = None     # door we're targeting now
+        self.pending_door_future = None
 
-        # periodic publishing + mission loop
+        # Mission state machine
+        self.state = self.EXPLORING_WORLD
+
+        # Timers
         self.create_timer(0.5, self.publish_map)
         self.create_timer(0.2, self.mission_step)
+        self.create_timer(0.5, self.update_goal_from_tf)
 
         # mark start cell free
         sx, sy = self.world_to_map(0.0, 0.0)
         self.set_cell(sx, sy, 0)
 
-        # door detector: sample spaced LiDAR readings and flag beam outliers
-        self.door_detector = DoorDetector(buffer_size=6, sample_interval=0.8, std_multiplier=2.0)
-        
-        # track detected doors to prevent false positives from drone position jitter
-        self.detected_doors = set()  # set of (mx, my) tuples that are confirmed doors
-
-        self.get_logger().info(f"Rescue mission initialized. Map {self.map_width}x{self.map_height}")
+        self.get_logger().info(
+            f"Rescue mission initialized. Map {self.map_width}x{self.map_height}, "
+            f"starting in EXPLORING_WORLD"
+        )
 
     # ============================
     # Coordinate conversions
     # ============================
 
     def world_to_map(self, wx, wy):
-        mx = int(math.floor((wx - self.origin_x) + 0.5))
-        my = int(math.floor((wy - self.origin_y) + 0.5))
+        mx = int(math.floor((wx - self.origin_x) / self.resolution))
+        my = int(math.floor((wy - self.origin_y) / self.resolution))
         return mx, my
 
     def map_to_world(self, mx, my):
-        wx = self.origin_x + mx * self.resolution
-        wy = self.origin_y + my * self.resolution
+        wx = self.origin_x + (mx + 0.5) * self.resolution
+        wy = self.origin_y + (my + 0.5) * self.resolution
         return float(wx), float(wy)
 
     def map_index(self, mx, my):
@@ -161,9 +177,11 @@ class RescueMission(Node):
         if idx < 0:
             return
         cur = self.grid[idx]
-        if cur < 0:  # preserve doors/goal
+        # preserve sentinel values
+        if cur < 0:
             return
-        if cur == 0 and val > 0:  # sticky free rule
+        # don't overwrite definitely free with "less free"
+        if cur == 0 and val > 0:
             return
         self.grid[idx] = max(0, min(100, int(val)))
 
@@ -171,45 +189,71 @@ class RescueMission(Node):
     # Callbacks
     # ============================
 
-    def gps_callback(self, msg):
+    def gps_callback(self, msg: PoseStamped):
         self.drone_x = msg.pose.position.x
         self.drone_y = msg.pose.position.y
         self.has_gps = True
 
-    def keys_cb(self, msg):
+    def keys_cb(self, msg: Int32):
         self.keys_remaining = msg.data
 
-    def cell_tower_cb(self, msg):
-        """Get dog's last known position in cell_tower frame → transform to world."""
+    def map_callback(self, msg):
+        self.map = msg
+        self.map_ready = True
+
+        self.map_width = msg.info.width
+        self.map_height = msg.info.height
+        self.resolution = msg.info.resolution
+
+        self.origin_x = msg.info.origin.position.x
+        self.origin_y = msg.info.origin.position.y
+
+        # Convert map data from int8 array to Python list
+        self.grid = list(msg.data)
+
+        self.get_logger().info(
+            f"Map loaded: {self.map_width}x{self.map_height}, origin=({self.origin_x},{self.origin_y}), res={self.resolution}"
+        )
+
+    def update_goal_from_tf(self):
         if self.has_goal:
             return
 
         try:
-            transform = self.tf_buffer.lookup_transform("world", msg.header.frame_id, Time().to_msg())
-            world_pt = do_transform_point(msg, transform)
+            transform = self.tf_buffer.lookup_transform(
+                "cell_tower", "world", rclpy.time.Time()
+            )
 
-            gx = world_pt.point.x
-            gy = world_pt.point.y
+            gx = transform.transform.translation.x
+            gy = transform.transform.translation.y
 
-            self.goal_world = (gx, gy)
-            self.goal_cell = self.world_to_map(gx, gy)
+            self.get_logger().info(
+                f"[TF-GOAL] Dog located via TF at tower=({gx:.2f}, {gy:.2f})"
+            )
 
-            mx, my = self.goal_cell
+            mx, my = self.world_to_map(gx, gy)
+            # Hardcode for debugging:
+            self.goal = (10, 10)  # map coordinates
+
+            self.get_logger().info(f"Debug goal set to {self.goal}")
+            self.goal_cell = (10, 10)
+            self.has_goal = True
+
             idx = self.map_index(mx, my)
             if idx >= 0:
-                self.grid[idx] = -3  # goal marker
+                self.grid[idx] = -3
 
-            self.has_goal = True
-            self.get_logger().info(f"Dog located at world=({gx:.2f},{gy:.2f}), map={self.goal_cell}")
+            self.get_logger().info(
+                f"[TF-GOAL] Mapped dog to cell=({mx},{my}) — goal set."
+            )
 
-        except TransformException as e:
-            self.get_logger().warn(f"TF failed: {e}")
+        except Exception as e:
+            # Normal until TF has enough data
+            self.get_logger().debug(f"[TF-GOAL] TF not ready: {e}")
 
-    # ============================
-    # LIDAR mapping
-    # ============================
 
-    def lidar_callback(self, msg):
+    def lidar_callback(self, msg: LaserScan):
+        # Mapping happens regardless of mission state
         if not self.has_gps:
             return
 
@@ -226,6 +270,7 @@ class RescueMission(Node):
             t = 0.0
             last = None
 
+            # free cells along beam
             while t < dist:
                 wx = self.drone_x + t * math.cos(angle)
                 wy = self.drone_y + t * math.sin(angle)
@@ -239,6 +284,7 @@ class RescueMission(Node):
 
                 t += step
 
+            # occupied at hit
             if math.isfinite(r) and dist > 0:
                 hx = self.drone_x + dist * math.cos(angle)
                 hy = self.drone_y + dist * math.sin(angle)
@@ -249,7 +295,7 @@ class RescueMission(Node):
 
             angle += msg.angle_increment
 
-        # Door detection: sample scans at a lower rate to avoid GPS/LIDAR jitter
+        # Door detection (runs slower internally via DoorDetector)
         try:
             sampled = self.door_detector.sample_scan(msg)
             if sampled:
@@ -264,7 +310,6 @@ class RescueMission(Node):
                     hy = self.drone_y + r * math.sin(ang)
                     mx, my = self.world_to_map(hx, hy)
 
-                    # Filter 1: Don't mark detections at or very close to drone's current position
                     drone_mx, drone_my = self.world_to_map(self.drone_x, self.drone_y)
                     dist_to_drone = math.hypot(mx - drone_mx, my - drone_my)
                     if dist_to_drone < 0.5:
@@ -272,42 +317,65 @@ class RescueMission(Node):
 
                     cur = self.get_cell(mx, my)
                     if cur is not None and cur not in (-1, -2, -3):
-                        # Filter 2: Check if this detection clusters with any already-detected door
+                        # avoid duplicating the same door in slightly different cells
                         is_new_door = True
                         for ddx, ddy in self.detected_doors:
                             if math.hypot(mx - ddx, my - ddy) < 1.5:
                                 is_new_door = False
                                 break
-                        
+
                         if is_new_door:
-                            # mark as suspected closed door with special value -1 for visual distinction
                             idx = self.map_index(mx, my)
                             if idx >= 0:
-                                self.grid[idx] = -1
+                                self.grid[idx] = -1  # door (closed) sentinel
                             self.detected_doors.add((mx, my))
-                            # only log if enough time has passed (avoid spam)
-                            if self.door_detector.should_report_candidate(mx, my, report_cooldown=5.0):
-                                self.get_logger().info(f"New door detected at ({mx}, {my}) from beam {beam_idx} (std={stdv:.3f})")
+
+                            if self.door_detector.should_report_candidate(
+                                mx, my, report_cooldown=5.0
+                            ):
+                                self.get_logger().info(
+                                    f"New door detected at ({mx}, {my}) "
+                                    f"from beam {beam_idx} (std={stdv:.3f})"
+                                )
         except Exception as e:
             self.get_logger().warn(f"Door detection error: {e}")
 
     # ============================
-    # Mission step machine
+    # Mission State Machine
     # ============================
 
     def mission_step(self):
-        if self.state == self.WAIT_FOR_GOAL:
-            if self.has_gps and self.has_goal:
-                self.get_logger().info("Goal + GPS acquired → planning.")
-                self.state = self.PLAN_PATH
+        self.get_logger().info(
+            f"[STEP] State={self.state} | GPS={self.has_gps} "
+            f"| Goal={self.goal_cell} | Keys={self.keys_remaining}"
+        )
+        # Need both GPS and goal to meaningfully move
+        if not self.has_gps or not self.has_goal:
+            return
 
-        elif self.state == self.PLAN_PATH:
-            self.plan_path()
+        if self.state == self.EXPLORING_WORLD:
+            # Exploring means: build map and, once we know the goal, plan a path.
+            if not self.current_path_world:
+                self.get_logger().info(
+                    "EXPLORING_WORLD: goal known, planning initial path."
+                )
+                self.plan_path()
+            self.state = self.MOVING_TO_WAYPOINT
 
-        elif self.state == self.FOLLOW_PATH:
-            self.follow_path()
+        elif self.state == self.MOVING_TO_WAYPOINT:
+            self.follow_path_step()
+
+        elif self.state == self.LOCATING_DOORS:
+            self.locate_door_step()
+
+        elif self.state == self.OPENING_DOORS:
+            self.open_door_step()
+
+        elif self.state == self.UPDATING_MAP:
+            self.update_map_and_replan()
 
         elif self.state == self.AT_GOAL:
+            # nothing to do
             return
 
     # ============================
@@ -318,24 +386,25 @@ class RescueMission(Node):
         val = self.get_cell(mx, my)
         if val is None:
             return False
-        if val == -1:
+        if val == -1:   # closed door cell (treated as obstacle until opened)
             return False
-        if val in (-2, -3):
+        if val in (-2, -3):  # open door or goal
             return True
         return val < 70
 
     def neighbors(self, mx, my):
-        for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
             nx, ny = mx + dx, my + dy
             if 0 <= nx < self.map_width and 0 <= ny < self.map_height:
                 if self.is_free(nx, ny):
                     yield (nx, ny)
 
     def astar(self, start, goal):
-        def h(a,b): return abs(a[0]-b[0]) + abs(a[1]-b[1])
+        def h(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-        pq = [(h(start,goal), start)]
-        g = {start: 0}
+        pq = [(h(start, goal), start)]
+        g = {start: 0.0}
         came = {start: None}
 
         while pq:
@@ -344,20 +413,20 @@ class RescueMission(Node):
             if cur == goal:
                 path = []
                 c = cur
-                while c:
+                while c is not None:
                     path.append(c)
                     c = came[c]
                 return path[::-1]
 
             for nbr in self.neighbors(*cur):
                 cell_val = self.get_cell(*nbr)
-                step = 1.0 + (0.2 if cell_val == 50 else 0)
+                step = 1.0 + (0.2 if cell_val == 50 else 0.0)
                 new_g = g[cur] + step
 
                 if new_g < g.get(nbr, 1e9):
                     g[nbr] = new_g
                     came[nbr] = cur
-                    heapq.heappush(pq, (new_g + h(nbr,goal), nbr))
+                    heapq.heappush(pq, (new_g + h(nbr, goal), nbr))
 
         return []
 
@@ -369,12 +438,18 @@ class RescueMission(Node):
         path = self.astar(start, goal)
 
         if not path:
-            self.get_logger().warn("A* failed → will retry.")
+            self.get_logger().warn("A* failed → no path currently, will retry later.")
+            self.current_path_cells = []
+            self.current_path_world = []
+            self.wp_index = 0
             return
 
         self.current_path_cells = path
-        self.current_path_world = [self.map_to_world(mx, my) for (mx,my) in path]
+        self.current_path_world = [self.map_to_world(mx, my) for (mx, my) in path]
         self.wp_index = 0
+        self.get_logger().info(
+            f"[PLAN] Path length={len(path)} | First WP={path[0] if path else None}"
+        )
 
         # debug path publish
         flat = []
@@ -383,45 +458,158 @@ class RescueMission(Node):
         msg = Int32MultiArray(data=flat)
         self.debug_path_pub.publish(msg)
 
-        self.state = self.FOLLOW_PATH
+        self.get_logger().info(
+            f"New path planned with {len(self.current_path_world)} waypoints."
+        )
 
     # ============================
-    # Path following + door handling
+    # MOVING_TO_WAYPOINT
     # ============================
 
-    def follow_path(self):
+    def follow_path_step(self):
+        # High-level movement debug
+        self.get_logger().info(
+            f"[MOVE] State=MOVING_TO_WAYPOINT | wp_index={self.wp_index}/{len(self.current_path_world)} "
+            f"| drone=({self.drone_x:.2f},{self.drone_y:.2f})"
+        )
+
+        # No path or finished path
+        if not self.current_path_world:
+            self.get_logger().warn("[MOVE] No path available — cannot move. Waiting for replanning.")
+            return
+
         if self.wp_index >= len(self.current_path_world):
-            self.get_logger().info("Reached the goal. Mission complete!")
+            self.get_logger().info("[MOVE] Final waypoint reached → AT_GOAL")
             self.publish_final_path()
             self.state = self.AT_GOAL
             return
 
+        # Extract waypoint
         wx, wy = self.current_path_world[self.wp_index]
         mx, my = self.world_to_map(wx, wy)
         cell = self.get_cell(mx, my)
 
-        # blocked → try door or replan
-        if cell is not None and cell >= 70:
-            # try opening if close enough
-            if self.keys_remaining > 0 and (mx, my) not in self.tried_door_cells:
-                dist = math.hypot(wx - self.drone_x, wy - self.drone_y)
-                if dist <= 1.0:
-                    self.get_logger().info(f"Attempting to open door at {mx,my}")
-                    self.tried_door_cells.add((mx,my))
-                    self.try_open_door(wx, wy, mx, my)
-                    return
+        self.get_logger().info(
+            f"[MOVE] Target WP#{self.wp_index}: world=({wx:.2f},{wy:.2f}) map={mx,my} cell_val={cell}"
+        )
 
-            # otherwise replan
-            self.state = self.PLAN_PATH
+        # Check for obstacle at waypoint
+        if cell is not None and cell >= 70:
+            self.get_logger().warn(
+                f"[BLOCK] Path blocked at map cell {mx,my} (val={cell}) → switching to LOCATING_DOORS"
+            )
+            self.current_blocked_cell = (mx, my)
+            self.state = self.LOCATING_DOORS
             return
 
-        # otherwise move to waypoint
+        # NORMAL MOVEMENT
+        self.get_logger().info(
+            f"[MOVE] Publishing movement command → ({wx:.2f}, {wy:.2f})"
+        )
         cmd = Vector3(x=float(wx), y=float(wy), z=0.0)
         self.cmd_pub.publish(cmd)
 
-        # check arrival
-        if math.hypot(self.drone_x - wx, self.drone_y - wy) < 0.4:
+        # ARRIVAL CHECK
+        dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
+        self.get_logger().info(f"[MOVE] Distance to WP = {dist:.3f}")
+
+        if dist < 0.4:
+            self.get_logger().info(f"[ARRIVAL] Arrived at WP#{self.wp_index}")
+
+            # Door sealing logic
+            if cell == -2:
+                idx = self.map_index(mx, my)
+                if idx >= 0:
+                    self.grid[idx] = 100
+                    self.get_logger().info(
+                        f"[DOOR] Sealing door behind drone at cell {mx,my} (now marked wall)"
+                    )
+
             self.wp_index += 1
+            self.get_logger().info(f"[MOVE] Advancing to WP#{self.wp_index}")
+
+
+    # ============================
+    # LOCATING_DOORS
+    # ============================
+
+    def locate_door_step(self):
+        """We hit a blocked cell; decide if this is a door worth opening."""
+        if self.current_blocked_cell is None:
+            self.get_logger().info(
+                "LOCATING_DOORS: no blocked cell stored → going to UPDATING_MAP."
+            )
+            self.state = self.UPDATING_MAP
+            return
+
+        if not self.detected_doors:
+            self.get_logger().info(
+                "LOCATING_DOORS: blocked but no known doors → UPDATING_MAP."
+            )
+            self.state = self.UPDATING_MAP
+            return
+
+        bx, by = self.current_blocked_cell
+
+        # choose the closest detected door to the blocked cell
+        best = min(
+            self.detected_doors,
+            key=lambda d: math.hypot(d[0] - bx, d[1] - by),
+        )
+
+        self.current_door_cell = best
+        self.get_logger().info(
+            f"LOCATING_DOORS: blocked at {self.current_blocked_cell}, "
+            f"choosing door at {self.current_door_cell} → OPENING_DOORS."
+        )
+        self.state = self.OPENING_DOORS
+
+    # ============================
+    # OPENING_DOORS
+    # ============================
+
+    def open_door_step(self):
+        """Move to the chosen door and attempt to open it."""
+        if self.current_door_cell is None:
+            self.get_logger().info(
+                "OPENING_DOORS: no door selected → UPDATING_MAP."
+            )
+            self.state = self.UPDATING_MAP
+            return
+
+        if self.keys_remaining <= 0:
+            self.get_logger().info(
+                "OPENING_DOORS: no keys remaining → UPDATING_MAP."
+            )
+            self.state = self.UPDATING_MAP
+            return
+
+        door_mx, door_my = self.current_door_cell
+        wx, wy = self.map_to_world(door_mx, door_my)
+
+        dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
+
+        # Move up to the door if we're not close enough yet
+        if dist > 0.8:
+            cmd = Vector3(x=float(wx), y=float(wy), z=0.0)
+            self.cmd_pub.publish(cmd)
+            return
+
+        # Close enough to attempt the door
+        if self.pending_door_future is not None:
+            # we've already called the service; just wait for callback to update state
+            return
+
+        if (door_mx, door_my) in self.tried_door_cells:
+            self.get_logger().info(
+                "OPENING_DOORS: already tried this door → UPDATING_MAP."
+            )
+            self.state = self.UPDATING_MAP
+            return
+
+        self.get_logger().info(f"OPENING_DOORS: attempting door at {door_mx, door_my}")
+        self.tried_door_cells.add((door_mx, door_my))
+        self.try_open_door(wx, wy, door_mx, door_my)
 
     def try_open_door(self, wx, wy, mx, my):
         if not self.use_key_client.service_is_ready():
@@ -432,29 +620,62 @@ class RescueMission(Node):
         req.door_loc = Point(x=float(wx), y=float(wy), z=0.0)
 
         future = self.use_key_client.call_async(req)
+        self.pending_door_future = future
 
-        def callback(fut, cell=(mx,my)):
+        def callback(fut, cell=(mx, my), self_ref=self):
             try:
                 res = fut.result()
             except Exception as e:
-                self.get_logger().warn(f"use_key failed: {e}")
+                self_ref.get_logger().warn(f"use_key failed: {e}")
+                self_ref.pending_door_future = None
+                self_ref.state = self_ref.UPDATING_MAP
                 return
 
             cmx, cmy = cell
-            idx = self.map_index(cmx, cmy)
-            if idx < 0: return
+            idx = self_ref.map_index(cmx, cmy)
+            if idx < 0:
+                self_ref.pending_door_future = None
+                self_ref.state = self_ref.UPDATING_MAP
+                return
 
             if res.success:
-                self.grid[idx] = -2  # opened door
-                self.get_logger().info(f"Door opened at {cell}")
+                # mark as open door now
+                self_ref.grid[idx] = -2
+                self_ref.get_logger().info(f"Door opened at {cell}")
             else:
-                self.grid[idx] = -1  # closed door
-                self.get_logger().info(f"Door failed at {cell}")
+                # mark as permanently closed / wall
+                self_ref.grid[idx] = 100
+                self_ref.get_logger().info(f"Door failed at {cell}")
+
+            self_ref.pending_door_future = None
+            # after opening/closing, replan
+            self_ref.state = self_ref.UPDATING_MAP
 
         future.add_done_callback(callback)
 
     # ============================
-    # Publish map + final path
+    # UPDATING_MAP
+    # ============================
+
+    def update_map_and_replan(self):
+        """Replan after a door interaction or blockage."""
+        self.get_logger().info("UPDATING_MAP: replanning path after map change.")
+        self.plan_path()
+        self.current_blocked_cell = None
+        self.current_door_cell = None
+
+        if not self.current_path_world:
+            # still no path; remain in UPDATING_MAP and just keep trying next ticks
+            self.get_logger().warn(
+                "UPDATING_MAP: no path found; will try again as map improves."
+            )
+            return
+
+        # once we have a path, go back to moving
+        self.state = self.MOVING_TO_WAYPOINT
+
+    # ============================
+    # Map + final path publishing
     # ============================
 
     def publish_map(self):
@@ -482,11 +703,11 @@ class RescueMission(Node):
 
 
 def main(args=None):
-	rclpy.init(args=args)
-	node = RescueMission()
-	rclpy.spin(node)
-	rclpy.shutdown()
+    rclpy.init(args=args)
+    node = RescueMission()
+    rclpy.spin(node)
+    rclpy.shutdown()
 
 
 if __name__ == "__main__":
-	main()
+    main()
