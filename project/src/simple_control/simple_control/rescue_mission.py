@@ -542,38 +542,40 @@ class RescueMission(Node):
             self.state = self.LOCATING_DOORS
             return
 
-        # ------------------------------
-        # Manhattan Movement Style 2
-        # (dominant axis first)
-        # ------------------------------
-        dx = wx - self.drone_x
-        dy = wy - self.drone_y
+        # Arrived at waypoint
+        # Tile-based pause
+        self.get_logger().info(
+            f"[MOVE] Arrived at waypoint ({target_mx},{target_my}) — pausing"
+        )
 
-        if abs(dx) > abs(dy):
-            # horizontal first
-            step = 0.5 if dx > 0 else -0.5
-            tx = self.drone_x + step
-            ty = self.drone_y
-        else:
-            # vertical first
-            step = 0.5 if dy > 0 else -0.5
-            tx = self.drone_x
-            ty = self.drone_y + step
-
-        cmd = Vector3(x=float(tx), y=float(ty), z=0.0)
+        cmd = Vector3(x=float(target_x), y=float(target_y), z=0.0)
         self.cmd_pub.publish(cmd)
 
-        # Distance check
+        # ARRIVAL + PAUSE BETWEEN TILES
+
         dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
-        if dist < 0.30:
-            # ALWAYS PAUSE AT WAYPOINT
+        self.get_logger().info(f"[MOVE] Distance to WP = {dist:.3f}")
+
+        if dist < 0.4:
+            self.get_logger().info(f"[ARRIVAL] Arrived at WP#{self.wp_index}")
+
+            # If this was an open door AND we have now passed through it,
+            # then convert it to a wall (100) only AFTER leaving it.
+            if cell == -2:
+                idx = self.map_index(mx, my)
+                if idx >= 0:
+                    self.grid[idx] = 100
+                    self.get_logger().info(
+                        f"[DOOR] Sealed door at {mx,my} AFTER visiting."
+                    )
+
+            # Advance to next waypoint
             self.wp_index += 1
             self.movement_pause = True
 
             if self.pause_timer:
                 self.pause_timer.cancel()
             self.pause_timer = self.create_timer(self.pause_duration, self.resume_movement)
-
 
     # ============================
     # LOCATING_DOORS
