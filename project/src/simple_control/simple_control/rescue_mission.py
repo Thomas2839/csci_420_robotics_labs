@@ -572,7 +572,7 @@ class RescueMission(Node):
             self.cmd_pub.publish(cmd)
             return
 
-        # Arrived at waypoint!
+        # Arrived at waypoint
         # Tile-based pause
         self.get_logger().info(
             f"[MOVE] Arrived at waypoint ({target_mx},{target_my}) — pausing"

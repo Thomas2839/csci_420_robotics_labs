@@ -77,7 +77,7 @@ class AStarPlanner:
         expanded = self.expand_obstacles(map_data, self.safe_distance)
 
         goal_n = Node(goal_position)
-
+        #front
         frontier = PriorityQueue()
         closed = []
         counter = itertools.count()
