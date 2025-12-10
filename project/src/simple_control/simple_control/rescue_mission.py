@@ -592,14 +592,8 @@ class RescueMission(Node):
         dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
         self.get_logger().info(f"[MOVE] Distance to WP = {dist:.3f}")
 
-        # "Close enough" to consider we are on this tile
-        if dist < 0.3:
-            self.get_logger().info(f"[ARRIVAL] Arrived at WP#{self.wp_index} (map {mx,my})")
-
-            # Optional: mark visited cells or do door-adjacency logic here
-            if hasattr(self, "visited_cells"):
-                self.visited_cells.add((mx, my))
-                self.get_logger().info(f"[MOVE] Marked {mx,my} as visited.")
+        if dist < 0.4:
+            self.get_logger().info(f"[ARRIVAL] Arrived at WP#{self.wp_index}")
 
             # If this was an open door AND we have now passed through it,
             # then convert it to a wall (100) only AFTER leaving it.
@@ -622,7 +616,6 @@ class RescueMission(Node):
             if self.pause_timer is not None:
                 self.pause_timer.cancel()
             self.pause_timer = self.create_timer(self.pause_duration, self.resume_movement)
-
 
     # ============================
     # LOCATING_DOORS
