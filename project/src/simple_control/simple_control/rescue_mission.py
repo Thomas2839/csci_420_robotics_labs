@@ -511,77 +511,71 @@ class RescueMission(Node):
             self.pause_timer = None
 
     def follow_path_step(self):
-        # If we are currently paused, do nothing this tick
-        if self.movement_pause:
-            self.get_logger().info(
-                f"[MOVE] Paused between tiles; wp_index={self.wp_index}/{len(self.current_path_world)} "
-                f"| drone=({self.drone_x:.2f},{self.drone_y:.2f})"
-            )
+        """
+        Executes waypoint following for MOVING_TO_WAYPOINT state.
+
+        Ensures:
+        • uses the latest A* path (self.current_path_cells)
+        • waypoint index is valid
+        • pauses between tiles
+        • door-adjacent paths behave correctly
+        """
+
+        # Ensure GPS lock
+        if not self.has_gps:
             return
 
-        # High-level movement debug
+        # Empty path? → replan
+        if not self.current_path_cells:
+            self.get_logger().warn("[MOVE] No path → UPDATING_MAP")
+            self.state = self.UPDATING_MAP
+            return
+
+        # Valid waypoint index?
+        if self.wp_index >= len(self.current_path_cells):
+            self.get_logger().info("[MOVE] Reached end of path → UPDATING_MAP")
+            self.state = self.UPDATING_MAP
+            return
+
+        # Current target waypoint
+        target_mx, target_my = self.current_path_cells[self.wp_index]
+        tx, ty = self.map_to_world(target_mx, target_my)
+
+        # DEBUG — ensure the path is correct
         self.get_logger().info(
-            f"[MOVE] State=MOVING_TO_WAYPOINT | wp_index={self.wp_index}/{len(self.current_path_world)} "
-            f"| drone=({self.drone_x:.2f},{self.drone_y:.2f})"
+            f"[MOVE] wp_index={self.wp_index}/{len(self.current_path_cells)} "
+            f"target_map=({target_mx},{target_my}) target_world=({tx:.2f},{ty:.2f})"
         )
 
-        # No path or finished path
-        if not self.current_path_world:
-            self.get_logger().warn("[MOVE] No path available — cannot move. Waiting for replanning.")
+        # Check for blocked tile
+        cell_val = self.get_cell(target_mx, target_my)
+        if cell_val is None:
+            self.get_logger().warn("[MOVE] Target out of bounds → UPDATING_MAP")
+            self.state = self.UPDATING_MAP
             return
 
-        if self.wp_index >= len(self.current_path_world):
-            self.get_logger().info("[MOVE] Final waypoint reached → AT_GOAL")
-            self.publish_final_path()
-            self.state = self.AT_GOAL
-            return
-
-        # Extract waypoint
-        wx, wy = self.current_path_world[self.wp_index]
-        mx, my = self.world_to_map(wx, wy)
-        cell = self.get_cell(mx, my)
-
-        self.get_logger().info(
-            f"[MOVE] Target WP#{self.wp_index}: world=({wx:.2f},{wy:.2f}) map={mx,my} cell_val={cell}"
-        )
-
-        # Check obstacle at the waypoint
-        if cell is not None and (cell >= 70 or cell == -1):
+        if cell_val >= 70 or cell_val == -1:
             self.get_logger().warn(
-                f"[BLOCK] Path blocked at map cell {mx,my} (val={cell}) → LOCATING_DOORS"
+                f"[BLOCK] Path blocked at ({target_mx},{target_my}) (val={cell_val}) "
+                f"→ LOCATING_DOORS"
             )
-            self.current_blocked_cell = (mx, my)
+            self.current_blocked_cell = (target_mx, target_my)
             self.state = self.LOCATING_DOORS
             return
 
-        # Check the line between drone → waypoint
-        if not self.path_clear_between(self.drone_x, self.drone_y, wx, wy):
-            self.get_logger().warn(
-                f"[BLOCK] Obstacle detected along path to WP#{self.wp_index} → LOCATING_DOORS"
-            )
-            self.current_blocked_cell = (mx, my)
-            self.state = self.LOCATING_DOORS
+        # Move toward the waypoint
+        dist = math.hypot(self.drone_x - tx, self.drone_y - ty)
+
+        if dist > 0.3:
+            # Move closer
+            cmd = Vector3(x=float(tx), y=float(ty), z=0.0)
+            self.cmd_pub.publish(cmd)
             return
 
-        #  MOVEMENT LOGIC: MOVE IN STRAIGHT LINES (NO DIAGONALS)
-
-        dx = wx - self.drone_x
-        dy = wy - self.drone_y
-
-        # Determine movement direction
-        if abs(dx) > abs(dy):
-            # Move horizontally
-            step = 0.5 if dx > 0 else -0.5
-            target_x = self.drone_x + step
-            target_y = self.drone_y
-        else:
-            # Move vertically
-            step = 0.5 if dy > 0 else -0.5
-            target_x = self.drone_x
-            target_y = self.drone_y + step
-
+        # Arrived at waypoint
+        # Tile-based pause
         self.get_logger().info(
-            f"[MOVE] Stepping toward tile center → ({target_x:.2f}, {target_y:.2f})"
+            f"[MOVE] Arrived at waypoint ({target_mx},{target_my}) — pausing"
         )
 
         cmd = Vector3(x=float(target_x), y=float(target_y), z=0.0)
@@ -607,15 +601,12 @@ class RescueMission(Node):
 
             # Advance to next waypoint
             self.wp_index += 1
-            self.get_logger().info(
-                f"[MOVE] Advancing to WP#{self.wp_index} and pausing for {self.pause_duration:.1f}s."
-            )
+            self.movement_pause = False
+            self.pause_timer = None
 
-            # Engage pause so we don't immediately start stepping toward the next tile
+        if not self.movement_pause:
             self.movement_pause = True
-            if self.pause_timer is not None:
-                self.pause_timer.cancel()
-            self.pause_timer = self.create_timer(self.pause_duration, self.resume_movement)
+            self.pause_timer = self.create_timer(self.pause_duration, advance_wp)
 
     # ============================
     # LOCATING_DOORS
