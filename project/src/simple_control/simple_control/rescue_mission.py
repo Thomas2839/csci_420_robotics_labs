@@ -38,7 +38,7 @@ from rosidl_runtime_py.utilities import get_message
 
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-from simple_control.astar_class import AStarPlanner 
+from simple_control.astar_class import AStarPlanner
 
 
 class RescueMission(Node):
@@ -46,7 +46,7 @@ class RescueMission(Node):
 
     # ============================
     # Mission states (your design)
-    # ============================ 
+    # ============================
     EXPLORING_WORLD = 0
     LOCATING_DOORS = 1
     OPENING_DOORS = 2
@@ -64,8 +64,8 @@ class RescueMission(Node):
         self.declare_parameter('map_width', default_w)
         self.declare_parameter('map_height', default_h)
 
-        self.map_width = int(self.get_parameter('map_width').get_parameter_value().integer_value)
-        self.map_height = int(self.get_parameter('map_height').get_parameter_value().integer_value)
+        self.map_width = int(self.get_parameter('map_width').value)
+        self.map_height = int(self.get_parameter('map_height').value)
 
         # We use 1 meter per cell (resolution 1.0)
         self.resolution = 1.0
@@ -94,9 +94,10 @@ class RescueMission(Node):
         self.key_sub = self.create_subscription(
             Int32, "/keys_remaining", self.keys_cb, 10
         )
-        self.map_sub = self.create_subscription(
-            OccupancyGrid, "/map", self.map_callback, 10
-        )
+        # Don't subscribe to external map - we build our own from LIDAR
+        # self.map_sub = self.create_subscription(
+        #     OccupancyGrid, "/map", self.map_callback, 10
+        # )
         self.dog_sub = self.create_subscription(
             Point, '/cell_tower/position', self.dog_callback, 10
         )
@@ -138,6 +139,11 @@ class RescueMission(Node):
         # Mission state machine
         self.state = self.EXPLORING_WORLD
 
+        # Movement pause system (for tile-by-tile motion)
+        self.movement_pause = False      # True while waiting after arriving on a tile
+        self.pause_duration = 1.0        # seconds to pause between tiles
+        self.pause_timer = None          # rclpy.Timer object that clears the pause
+
         # Timers
         self.create_timer(0.5, self.publish_map)
         self.create_timer(0.2, self.mission_step)
@@ -156,11 +162,10 @@ class RescueMission(Node):
     # Coordinate conversions
     # ============================
 
-    def world_to_map(self, wx: float, wy: float) -> tuple[int, int]:
+    def world_to_map(self, wx: float, wy: float) -> tuple:
         mx = int(math.floor((wx - self.origin_x) + 0.5))
         my = int(math.floor((wy - self.origin_y) + 0.5))
         return mx, my
-
 
     def map_to_world(self, mx, my):
         wx = self.origin_x + (mx + 0.5) * self.resolution
@@ -203,23 +208,8 @@ class RescueMission(Node):
     def keys_cb(self, msg: Int32):
         self.keys_remaining = msg.data
 
-    def map_callback(self, msg):
-        self.map = msg
-        self.map_ready = True
-
-        self.map_width = msg.info.width
-        self.map_height = msg.info.height
-        self.resolution = msg.info.resolution
-
-        self.origin_x = msg.info.origin.position.x
-        self.origin_y = msg.info.origin.position.y
-
-        # Convert map data from int8 array to Python list
-        self.grid = list(msg.data)
-
-        self.get_logger().info(
-            f"Map loaded: {self.map_width}x{self.map_height}, origin=({self.origin_x},{self.origin_y}), res={self.resolution}"
-        )
+    # Note: map_callback removed - we build our own map from LIDAR data
+    # The external /map topic may have different dimensions/origin causing conflicts
 
     def dog_callback(self, msg):
         wrapped = PointStamped()
@@ -228,9 +218,9 @@ class RescueMission(Node):
         wrapped.point = msg
         self.dog_msg = wrapped
 
-        self.get_logger().info(
+        """ self.get_logger().info(
             f"[DOG] Point wrapped → PointStamped: ({msg.x:.2f}, {msg.y:.2f}, {msg.z:.2f})"
-        )
+        ) """
 
     def lidar_callback(self, msg: LaserScan):
         # Mapping happens regardless of mission state
@@ -296,7 +286,7 @@ class RescueMission(Node):
                         continue
 
                     cur = self.get_cell(mx, my)
-                    if cur is not None and cur not in (-1, -2, -3):
+                    if cur is not None and cur not in (-1, -2, -3) and cur >= 70 and stdv > 0.05:
                         # avoid duplicating the same door in slightly different cells
                         is_new_door = True
                         for ddx, ddy in self.detected_doors:
@@ -321,7 +311,7 @@ class RescueMission(Node):
             self.get_logger().warn(f"Door detection error: {e}")
 
     # ============================
-    # Updating Goal 
+    # Updating Goal
     # ============================
 
     def update_goal_from_tf(self):
@@ -329,40 +319,30 @@ class RescueMission(Node):
             return
 
         try:
-            """ # 1. Construct origin  in cell_tower frame
-            p = PointStamped()
-            p.header.frame_id = "cell_tower"
-            p.header.stamp = rclpy.time.Time().to_msg()
-            p.point.x = 0
-            p.point.y = 0
-            p.point.z = 0 """
-
-            # 2. Transform it into world frame
+            # Transform dog position from cell_tower to world frame
             transform = self.tf_buffer.lookup_transform("cell_tower", "world", rclpy.time.Time())
             dwp = do_transform_point(self.dog_msg, transform)
-            # origin_world_point = do_transform_point(p, transform)
 
             self.get_logger().info(
                 f"[TF] dog_world    = ({dwp.point.x:.2f}, "
                 f"{dwp.point.y:.2f}, {dwp.point.z:.2f})"
             )
 
-            # 2. Take transformed dog x and y
-            gdx = dwp.point.x 
+            # Take transformed dog x and y
+            gdx = dwp.point.x
             gdy = dwp.point.y
 
             self.get_logger().info(
                 f"[TF-GOAL] Dog world position = ({gdx:.2f}, {gdy:.2f})"
             )
 
-            # 3. Convert world → map
+            # Convert world → map
             mx, my = self.world_to_map(gdx, gdy)
             self.goal_cell = (mx, my)
             self.has_goal = True
 
         except Exception as e:
             self.get_logger().debug(f"[TF-GOAL] failed: {e}")
-
 
     # ============================
     # Mission State Machine
@@ -496,7 +476,7 @@ class RescueMission(Node):
         Returns True if path is clear.
         """
         dist = math.hypot(tx - sx, ty - sy)
-        
+
         # If the point is basically the same, treat as clear
         if dist < 1e-3:
             return True
@@ -518,8 +498,27 @@ class RescueMission(Node):
                 return False
 
         return True
+    
+    # Helper Method
+    def resume_movement(self):
+        """Timer callback: resume movement after a pause."""
+        self.get_logger().info("[MOVE] Pause finished → resuming movement.")
+        self.movement_pause = False
+
+        # Clean up the timer so we don't leak them
+        if self.pause_timer is not None:
+            self.pause_timer.cancel()
+            self.pause_timer = None
 
     def follow_path_step(self):
+        # If we are currently paused, do nothing this tick
+        if self.movement_pause:
+            self.get_logger().info(
+                f"[MOVE] Paused between tiles; wp_index={self.wp_index}/{len(self.current_path_world)} "
+                f"| drone=({self.drone_x:.2f},{self.drone_y:.2f})"
+            )
+            return
+
         # High-level movement debug
         self.get_logger().info(
             f"[MOVE] State=MOVING_TO_WAYPOINT | wp_index={self.wp_index}/{len(self.current_path_world)} "
@@ -564,9 +563,7 @@ class RescueMission(Node):
             self.state = self.LOCATING_DOORS
             return
 
-        # ----------------------------------------------------------
         #  MOVEMENT LOGIC: MOVE IN STRAIGHT LINES (NO DIAGONALS)
-        # ----------------------------------------------------------
 
         dx = wx - self.drone_x
         dy = wy - self.drone_y
@@ -584,24 +581,25 @@ class RescueMission(Node):
             target_y = self.drone_y + step
 
         self.get_logger().info(
-            f"[MOVE] Moving straight-line step → ({target_x:.2f}, {target_y:.2f})"
+            f"[MOVE] Stepping toward tile center → ({target_x:.2f}, {target_y:.2f})"
         )
 
         cmd = Vector3(x=float(target_x), y=float(target_y), z=0.0)
         self.cmd_pub.publish(cmd)
 
-        # ----------------------------------------------------------
-        # ARRIVAL CHECK
-        # ----------------------------------------------------------
+        # ARRIVAL + PAUSE BETWEEN TILES
 
         dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
         self.get_logger().info(f"[MOVE] Distance to WP = {dist:.3f}")
 
-        if dist < 0.4:
-            self.get_logger().info(f"[ARRIVAL] Arrived at WP#{self.wp_index}")
-            
-            # Add current cell to visited set
-            self.visited_cells.add((mx, my))
+        # "Close enough" to consider we are on this tile
+        if dist < 0.3:
+            self.get_logger().info(f"[ARRIVAL] Arrived at WP#{self.wp_index} (map {mx,my})")
+
+            # Optional: mark visited cells or do door-adjacency logic here
+            if hasattr(self, "visited_cells"):
+                self.visited_cells.add((mx, my))
+                self.get_logger().info(f"[MOVE] Marked {mx,my} as visited.")
 
             # If this was an open door AND we have now passed through it,
             # then convert it to a wall (100) only AFTER leaving it.
@@ -610,12 +608,20 @@ class RescueMission(Node):
                 if idx >= 0:
                     self.grid[idx] = 100
                     self.get_logger().info(
-                        f"[DOOR] Sealed door at {mx,my} AFTER visiting (correct behavior)"
+                        f"[DOOR] Sealed door at {mx,my} AFTER visiting."
                     )
 
             # Advance to next waypoint
             self.wp_index += 1
-            self.get_logger().info(f"[MOVE] Advancing to WP#{self.wp_index}")
+            self.get_logger().info(
+                f"[MOVE] Advancing to WP#{self.wp_index} and pausing for {self.pause_duration:.1f}s."
+            )
+
+            # Engage pause so we don't immediately start stepping toward the next tile
+            self.movement_pause = True
+            if self.pause_timer is not None:
+                self.pause_timer.cancel()
+            self.pause_timer = self.create_timer(self.pause_duration, self.resume_movement)
 
 
     # ============================
@@ -665,6 +671,8 @@ class RescueMission(Node):
             )
             self.state = self.UPDATING_MAP
             return
+        
+        self.get_logger().info(f"[DEBUG] Trying door at {self.current_door_cell}, real WP is {self.current_path_cells[:3]}")
 
         if self.keys_remaining <= 0:
             self.get_logger().info(
