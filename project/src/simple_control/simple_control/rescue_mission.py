@@ -637,13 +637,6 @@ class RescueMission(Node):
         door_mx, door_my = self.current_door_cell
         wx, wy = self.map_to_world(door_mx, door_my)
 
-        dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
-
-        # Move up to the door if we're not close enough yet
-        if dist > 0.8:
-            cmd = Vector3(x=float(wx), y=float(wy), z=0.0)
-            self.cmd_pub.publish(cmd)
-            return
 
         # Close enough to attempt the door
         if self.pending_door_future is not None:
