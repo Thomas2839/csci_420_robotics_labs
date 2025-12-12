@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 
 class DoorDetector:
-    def __init__(self, buffer_size: int = 6, sample_interval: float = 1.0, std_multiplier: float = 2.0):
+    def __init__(self, buffer_size: int = 6, sample_interval: float = 1.0, std_multiplier: float = 3.0):
         # number of historical samples to keep per beam
         self.buffer_size = int(buffer_size)
         # minimum seconds between stored samples (spacing to avoid jitter)

@@ -546,22 +546,32 @@ class RescueMission(Node):
             return
 
         # Extract waypoint
-        wx, wy = self.current_path_world[self.wp_index]
-        mx, my = self.world_to_map(wx, wy)
-        cell = self.get_cell(mx, my)
+        wx, wy = self.current_path_cells[self.wp_index]
+        #mx, my = self.world_to_map(wx, wy)
+        cell = self.get_cell(wx, wy)
         self.get_logger().info(
-            f"[MOVE] LOOK HERE FOR WP {self.wp_index}: world=({wx:.2f},{wy:.2f}), map=({mx},{my}), cell={cell}"
+            f"[MOVE] LOOK HERE FOR WP {self.wp_index}: world=({wx:.2f},{wy:.2f}), map=({wx},{wy}), cell={cell}"
         )
 
         # If the waypoint itself is blocked → just wait
         if cell is None or cell == -1 or cell >= 70:
-            self.get_logger().info(f"[MOVE] Waypoint {mx, my} is blocked — waiting.")
+            cx, cy = self.world_to_map(self.drone_x, self.drone_y)
+            cell_value = self.get_cell(cx, cy)
+            self.get_logger().info(
+                f"[MOVE] Drone current cell=({cx}, {cy}) has value {cell_value}"
+            )
+            self.get_logger().info(f"[MOVE] Waypoint {wx, wy} is blocked — waiting.")
             return
 
-        # If something blocks the space between drone and waypoint → wait
+        """ # If something blocks the space between drone and waypoint → wait
         if not self.path_clear_between(self.drone_x, self.drone_y, wx, wy):
+            cx, cy = self.world_to_map(self.drone_x, self.drone_y)
+            cell_value = self.get_cell(cx, cy)
+            self.get_logger().info(
+                f"[MOVE] PATH CLEAR LOGIC Drone current cell=({cx}, {cy}) has value {cell_value}"
+            )
             self.get_logger().info("[MOVE] Path to waypoint is blocked — waiting.")
-            return
+            return """
 
         # Manhattan movement
         dx = wx - self.drone_x
@@ -578,6 +588,11 @@ class RescueMission(Node):
 
         # Send movement command
         cmd = Vector3(x=float(tx), y=float(ty), z=0.0)
+        self.get_logger().info(
+            f"[MOVE] Moving toward ({tx:.2f}, {ty:.2f}) "
+            f"from ({self.drone_x:.2f}, {self.drone_y:.2f}) "
+            f"→ step=({tx - self.drone_x:.2f}, {ty - self.drone_y:.2f})"
+        )
         self.cmd_pub.publish(cmd)
 
         # If close enough to waypoint → pause + go to next
@@ -650,14 +665,6 @@ class RescueMission(Node):
 
         door_mx, door_my = self.current_door_cell
         wx, wy = self.map_to_world(door_mx, door_my)
-
-        dist = math.hypot(self.drone_x - wx, self.drone_y - wy)
-
-        # Move up to the door if we're not close enough yet
-        if dist > 0.8:
-            cmd = Vector3(x=float(wx), y=float(wy), z=0.0)
-            self.cmd_pub.publish(cmd)
-            return
 
         # Close enough to attempt the door
         if self.pending_door_future is not None:
